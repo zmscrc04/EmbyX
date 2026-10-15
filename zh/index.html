@@ -32,6 +32,7 @@
     <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.8.0/dist/mpegts.min.js"
         onerror="this.onerror=null;var s=document.createElement('script');s.src='lib/mpegts.min.js';document.head.appendChild(s)"></script>
     <script src="js/common.js"></script>
+    <script src="js/local.js"></script>
     <script src="js/nav.js"></script>
     <script src="js/player.js"></script>
     <script src="js/stage.js"></script>
@@ -391,6 +392,27 @@
                                 <i data-lucide="log-in" class="w-4 h-4 mr-2"></i>使用 NAS 账号登录
                             </button>
                         </div>
+
+                        <!-- 本地文件夹模式 -->
+                        <div id="localFolderBox" class="mb-4 p-4 rounded-lg border border-emerald-500/40 bg-emerald-500/10 transition-all">
+                            <div class="flex items-center space-x-2 mb-2">
+                                <i data-lucide="folder-open" class="w-4 h-4 text-emerald-400"></i>
+                                <span class="text-sm font-bold text-white">本地文件夹</span>
+                            </div>
+                            <p class="text-xs text-gray-400 mb-3 leading-relaxed">直接选择本机/映射盘中的影视目录，自动识别 NFO 与海报。无需 Emby 服务器。推荐 Chrome / Edge。</p>
+                            <div id="localFolderStatus" class="text-xs text-emerald-300/90 mb-3 hidden"></div>
+                            <div id="localScanProgress" class="hidden mb-3">
+                                <div class="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                                    <div id="localScanBar" class="h-full bg-emerald-500 transition-all duration-300" style="width:0%"></div>
+                                </div>
+                                <p id="localScanText" class="text-xs text-gray-400 mt-1.5">扫描中…</p>
+                            </div>
+                            <button id="localFolderBtn" type="button"
+                                class="w-full h-11 flex items-center justify-center bg-emerald-600 hover:bg-emerald-500 text-white text-sm rounded-lg font-bold active:scale-95 shadow-lg shadow-emerald-600/20 transition-all focusable-item">
+                                <i data-lucide="folder-plus" class="w-4 h-4 mr-2"></i>选择并扫描本地文件夹
+                            </button>
+                        </div>
+
                         <div class="space-y-4 bg-gray-800/40 p-4 rounded-lg border border-gray-700/50">
                             <div>
                                 <label class="text-gray-400 text-xs block mb-1.5">IP 或域名</label>
@@ -720,7 +742,7 @@
                     isFilteredByTag: false
                 };
 
-                this.config = { server: '', user: '', token: '', userId: '', useStatic: true, autoplay: true, shortDrama: false, deleteMode: false, fnOS: false };
+                this.config = { server: '', user: '', token: '', userId: '', useStatic: true, autoplay: true, shortDrama: false, deleteMode: false, fnOS: false, localMode: false };
 
                 this.csTimer = null;
 
@@ -894,6 +916,7 @@
                 this.config.shortDrama = localStorage.getItem('emby_shortdrama') === 'true';
                 this.config.deleteMode = localStorage.getItem('emby_delete_mode') === 'true';
                 this.config.fnOS = localStorage.getItem('emby_fnOS') === 'true';
+                this.config.localMode = localStorage.getItem('embyx_local_mode') === 'true';
 
                 // 生成或读取设备唯一 ID，解决多设备识别冲突问题
                 if (!localStorage.getItem('emby_device_id')) {
@@ -1242,6 +1265,43 @@
             async fetchVideos(parentId = null, ids = null, isLoadMore = false, isRandom = false, isAppend = false, searchTerm = '') {
                 this.toggleLoading(!isAppend); // 追加时不显示全屏 loading
                 try {
+                    // Local folder mode: serve from in-memory scan
+                    if (this.isLocalMode && this.isLocalMode()) {
+                        let items = (this._localItems || []).slice();
+                        if (searchTerm) {
+                            const q = searchTerm.toLowerCase();
+                            items = items.filter(it =>
+                                (it.Name || '').toLowerCase().includes(q) ||
+                                (it.Overview || '').toLowerCase().includes(q) ||
+                                (it.Path || '').toLowerCase().includes(q)
+                            );
+                        }
+                        if (ids) {
+                            const idSet = new Set(String(ids).split(','));
+                            items = items.filter(it => idSet.has(String(it.Id)));
+                        }
+                        if (isRandom) {
+                            for (let i = items.length - 1; i > 0; i--) {
+                                const j = Math.floor(Math.random() * (i + 1));
+                                [items[i], items[j]] = [items[j], items[i]];
+                            }
+                        }
+                        if (!isLoadMore && !isAppend) {
+                            this.state.videos = items;
+                            this.state.totalCount = items.length;
+                            this.state.startIndex = 0;
+                            this.state.currentIndex = 0;
+                        } else if (isAppend) {
+                            this.state.videos = this.state.videos.concat(items);
+                        }
+                        if (this.state.viewMode === 'grid') this.renderGridView();
+                        else if (this.state.videos.length) {
+                            this.renderSlides();
+                            this.loadVideo(this.state.currentIndex || 0);
+                        }
+                        return;
+                    }
+
                     const { server, token, userId } = this.config;
                     if (!server || !token) {
                         if (!isAppend) this.showToast('请先配置服务器');
@@ -1749,7 +1809,7 @@
                 this.updateUI();
             }
 
-            loadVideo(index) {
+            async loadVideo(index) {
                 if (this.state.viewMode !== 'stream') return;
 
                 this.state.playSessionId = 'ex_' + Date.now().toString(16);
@@ -1778,6 +1838,17 @@
                     }
                 }
 
+                // Local mode: create blob URLs on demand
+                if (videoData && videoData._local) {
+                    try {
+                        if (!videoData._localBlobUrl && videoData._fileHandle && window.EmbyXLocal) {
+                            videoData._localBlobUrl = await EmbyXLocal.getLocalVideoUrl(videoData);
+                        }
+                        if (!videoData._localImageUrl && videoData._imageHandle && window.EmbyXLocal) {
+                            videoData._localImageUrl = await EmbyXLocal.getLocalImageUrl(videoData);
+                        }
+                    } catch (e) { console.warn('local blob', e); }
+                }
                 const src = this.getVideoSrc(videoData.Id, videoData, true);
                 this.setVideoSource(videoEl, src, index, videoData, { autoplay: true });
 
@@ -1806,6 +1877,18 @@
                 btn.classList.add('hidden');
                 this.recalculateMetaInfoHeight();
                 if (!videoData || !videoData.Id) return;
+
+                // Local mode: use NFO actors if present
+                if (videoData._local) {
+                    const person = (videoData.People && videoData.People[0]) || null;
+                    if (person && person.Name) {
+                        btn.dataset.personName = person.Name;
+                        img.src = 'avatar.webp';
+                        btn.classList.remove('hidden');
+                        this.recalculateMetaInfoHeight();
+                    }
+                    return;
+                }
 
                 const currentId = String(videoData.Id);
                 btn.dataset.videoId = currentId;
@@ -1989,10 +2072,17 @@
             // --- 辅助功能 ---
 
             getVideoSrc(id, mediaItem, isPrimaryPlayback = false) {
+                if (mediaItem && mediaItem._local && mediaItem._localBlobUrl) {
+                    return mediaItem._localBlobUrl;
+                }
                 return this.player.getVideoSrc(id, mediaItem, isPrimaryPlayback);
             }
 
             getImageSrc(video) {
+                if (video && video._local) {
+                    if (video._localImageUrl) return video._localImageUrl;
+                    return 'poster.webp';
+                }
                 return EmbyXCommon.getItemImageUrl(this.config.server, video, this.config.token, 'poster.webp');
             }
 
@@ -2891,6 +2981,91 @@
             }
 
             // --- 事件绑定 ---
+
+            // ═══ 本地文件夹模式 ═══
+            async startLocalFolderMode() {
+                if (!window.EmbyXLocal || !EmbyXLocal.isSupported()) {
+                    this.showToast('当前浏览器不支持本地文件夹，请使用 Chrome / Edge');
+                    return;
+                }
+                const statusEl = document.getElementById('localFolderStatus');
+                const prog = document.getElementById('localScanProgress');
+                const bar = document.getElementById('localScanBar');
+                const txt = document.getElementById('localScanText');
+                try {
+                    const handle = await EmbyXLocal.pickDirectory();
+                    if (statusEl) {
+                        statusEl.classList.remove('hidden');
+                        statusEl.textContent = '已选择：' + (handle.name || '文件夹');
+                    }
+                    if (prog) prog.classList.remove('hidden');
+                    if (bar) bar.style.width = '5%';
+                    if (txt) txt.textContent = '正在列出文件…';
+
+                    const items = await EmbyXLocal.scanLibrary(handle, (p) => {
+                        if (p.phase === 'listing' || p.phase === 'listed') {
+                            if (txt) txt.textContent = `已扫描文件 ${p.scanned || 0}`;
+                            if (bar) bar.style.width = '20%';
+                        } else if (p.phase === 'parsing') {
+                            const pct = p.total ? Math.min(95, 20 + (p.scanned / p.total) * 75) : 50;
+                            if (bar) bar.style.width = pct + '%';
+                            if (txt) txt.textContent = `解析元数据 ${p.scanned}/${p.total} ${p.current || ''}`;
+                        } else if (p.phase === 'done') {
+                            if (bar) bar.style.width = '100%';
+                            if (txt) txt.textContent = `完成，共 ${p.scanned} 个视频`;
+                        }
+                    });
+
+                    this._localItems = items;
+                    this.config.localMode = true;
+                    this.config.server = 'local://folder';
+                    this.config.token = 'local';
+                    this.config.userId = 'local';
+                    this.config.user = handle.name || '本地文件夹';
+                    this.config.fnOS = false;
+                    localStorage.setItem('embyx_local_mode', 'true');
+                    localStorage.setItem('embyx_server_type', 'local');
+                    localStorage.setItem('emby_server', 'local://folder');
+                    localStorage.setItem('emby_token', 'local');
+                    localStorage.setItem('emby_uid', 'local');
+                    localStorage.setItem('emby_user', this.config.user);
+                    localStorage.removeItem('emby_fnOS');
+                    if (window.EmbyXCommon && EmbyXCommon.setServerType) EmbyXCommon.setServerType('local');
+
+                    this.state.videos = items.slice();
+                    this.state.totalCount = items.length;
+                    this.state.currentIndex = 0;
+                    this.state.currentLibraryId = 'local_root';
+                    this.state.startIndex = 0;
+                    this.state.favorites = new Set();
+
+                    this.showToast(`本地库就绪：${items.length} 个视频`);
+                    const layer = document.getElementById('profileLayer');
+                    if (layer) layer.classList.remove('active');
+
+                    if (items.length > 0) {
+                        if (this.state.viewMode === 'grid') this.renderGridView();
+                        else {
+                            this.renderSlides();
+                            this.loadVideo(0);
+                        }
+                    } else {
+                        this.showToast('未找到视频文件');
+                    }
+                } catch (e) {
+                    if (e && e.name === 'AbortError') this.showToast('已取消选择');
+                    else {
+                        console.error(e);
+                        this.showToast((e && e.message) || '本地文件夹加载失败');
+                    }
+                }
+            }
+
+            isLocalMode() {
+                return !!(this.config && (this.config.localMode || this.config.server === 'local://folder' ||
+                    (window.EmbyXCommon && EmbyXCommon.getServerType && EmbyXCommon.getServerType() === 'local')));
+            }
+
             bindEvents() {
                 this.dom.clickToPlayOverlay.onclick = () => {
                     this.dom.clickToPlayOverlay.style.display = 'none';
@@ -3174,6 +3349,8 @@
 
                 document.getElementById('closeProfileBtn').onclick = () => this.toggleModal('profilePage', false);
                 document.getElementById('saveConfigBtn').onclick = () => this.saveConfig();
+                const localFolderBtn = document.getElementById('localFolderBtn');
+                if (localFolderBtn) localFolderBtn.onclick = () => this.startLocalFolderMode();
                 const fnosOAuthBtn = document.getElementById('fnosOAuthBtn');
                 if (fnosOAuthBtn) fnosOAuthBtn.onclick = () => {
                     if (this._fnosOAuthUrl) this.openFnosOAuth(this._fnosOAuthUrl);
