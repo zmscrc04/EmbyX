@@ -1,9 +1,12 @@
 services:
   embyx:
-    image: ghcr.io/juneix/embyx:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: embyx-local:latest
     container_name: embyx
     restart: unless-stopped
     network_mode: host
     environment:
-      - APP_LANG=zh # zh (中文), en (English)
-      - APP_PORT=8090 # 访问端口 (Access Port)
+      - APP_LANG=zh
+      - APP_PORT=8090
